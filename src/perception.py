@@ -56,7 +56,7 @@ class PerceptionNode ( Node ) :
                 for box in boxes:
                     x1, y1, x2, y2 = box.xyxy[0].tolist()
                     u = int((x1 + x2) / 2)
-                    v = int((y1 + y2) / 2)
+                    v = int((y1git pull origin main --allow-unrelated-histories + y2) / 2)
 
                     err, point_cloud_value = self.point_cloud.get_value(u, v)
 
