@@ -18,12 +18,24 @@ Esse nó:
 
          5 caracteres ASCII: [steering hex 2c][estado 1c][potência hex 2c]
 
-     (ver v2.ino para detalhes do protocolo e o firmware que decodifica isso)
+     (ver v3.ino para detalhes do protocolo e o firmware que decodifica isso)
+
+  4. Assina 'kill_switch' (Bool), publicado pelo telemetry_node quando o
+     botão do dashboard é apertado. Enquanto killed=True, esse nó IGNORA a
+     navegação normal e fica mandando o comando de corte pro Arduino.
+
+  5. Publica 'car_telemetry' (String/JSON) periodicamente, com o status do
+     motor e outros dados -- consumido pelo telemetry_node, que repassa
+     pro dashboard via UDP. Importante: os dados de telemetria vêm do
+     ÚLTIMO COMANDO que este próprio nó mandou pro Arduino (não é uma
+     leitura de sensor real) -- decisão para não mexer no protocolo serial
+     já testado. Ver DECISOES.md.
 
   Também funciona como "watchdog": se nenhum waypoint novo chegar dentro de
   um tempo limite, o carro para sozinho (segurança).
 """
 
+import json
 import math
 import time
 
@@ -31,7 +43,7 @@ import serial
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, Bool, String
 
 
 class ControleNode(Node):
@@ -59,6 +71,9 @@ class ControleNode(Node):
         self.declare_parameter('waypoint_timeout', 1.0)       # [s] sem waypoint novo -> para
         self.declare_parameter('control_rate_hz', 20.0)       # frequência do loop de controle
 
+        # Telemetria
+        self.declare_parameter('telemetry_rate_hz', 10.0)     # frequência de publicação de telemetria
+
         # ---------------- Lendo os parâmetros ----------------
         self.wheelbase = self.get_parameter('wheelbase').value
         self.steering_center_deg = self.get_parameter('steering_center_deg').value
@@ -69,6 +84,7 @@ class ControleNode(Node):
         self.waypoint_timeout = self.get_parameter('waypoint_timeout').value
 
         control_rate_hz = self.get_parameter('control_rate_hz').value
+        telemetry_rate_hz = self.get_parameter('telemetry_rate_hz').value
 
         # ---------------- Conexão serial com o Arduino ----------------
         port = self.get_parameter('serial_port').value
@@ -92,8 +108,22 @@ class ControleNode(Node):
         self.y_wp = None
         self.last_waypoint_time = None
 
-        # ---------------- Timer de controle (também funciona como watchdog) ----------------
+        # ---------------- Kill switch (vem do telemetry_node) ----------------
+        self.killed = False
+        self.kill_subscription = self.create_subscription(
+            Bool, 'kill_switch', self.kill_switch_callback, 10)
+
+        # ---------------- Telemetria (vai para o telemetry_node) ----------------
+        self.telemetry_publisher = self.create_publisher(String, 'car_telemetry', 10)
+
+        # Último comando efetivamente mandado pro Arduino (fonte da telemetria)
+        self.last_state = 0
+        self.last_power_pct = 0
+        self.last_steering_deg = int(round(self.steering_center_deg))
+
+        # ---------------- Timers ----------------
         self.control_timer = self.create_timer(1.0 / control_rate_hz, self.control_loop)
+        self.telemetry_timer = self.create_timer(1.0 / telemetry_rate_hz, self.publish_telemetry)
 
         self.get_logger().info('Controle node iniciado')
 
@@ -110,10 +140,30 @@ class ControleNode(Node):
         self.last_waypoint_time = self.get_clock().now()
 
     # -------------------------------------------------------------------------
+    # Callback do tópico 'kill_switch'
+    # -------------------------------------------------------------------------
+    def kill_switch_callback(self, msg):
+        was_killed = self.killed
+        self.killed = bool(msg.data)
+
+        if self.killed and not was_killed:
+            self.get_logger().error('KILL SWITCH ACIONADO -- motor cortado e travado')
+        elif not self.killed and was_killed:
+            self.get_logger().info('Kill switch resetado -- destravando o Arduino')
+            # Manda o frame de reset (estado 8) imediatamente pro Arduino destravar,
+            # em vez de esperar o próximo tick do control_loop.
+            self.send_command(self.steering_center_deg, state=8, power_pct=0)
+
+    # -------------------------------------------------------------------------
     # Loop principal de controle
     # -------------------------------------------------------------------------
     def control_loop(self):
         if self.serial_conn is None:
+            return
+
+        # Kill switch tem prioridade absoluta sobre qualquer outra lógica de navegação
+        if self.killed:
+            self.send_command(self.steering_center_deg, state=9, power_pct=0)
             return
 
         # Nenhum waypoint recebido ainda
@@ -181,6 +231,9 @@ class ControleNode(Node):
     # Monta e envia o comando serial no protocolo esperado pelo Arduino
     # -------------------------------------------------------------------------
     def send_command(self, steering_deg, state, power_pct):
+        if self.serial_conn is None:
+            return
+
         steering_byte = int(round(steering_deg))
         steering_byte = max(0, min(255, steering_byte))
 
@@ -190,10 +243,44 @@ class ControleNode(Node):
         # 5 caracteres: 2 (steering hex) + 1 (estado) + 2 (potência hex)
         msg = f'{steering_byte:02X}{int(state)}{power_byte:02X}'
 
+        # Guarda o último comando enviado -- é essa informação que vira telemetria,
+        # em vez de ler de volta algum sensor do Arduino (ver DECISOES.md)
+        self.last_state = int(state)
+        self.last_power_pct = power_byte
+        self.last_steering_deg = steering_byte
+
         try:
             self.serial_conn.write(msg.encode('ascii'))
         except serial.SerialException as e:
             self.get_logger().error(f'Erro ao escrever na serial: {e}')
+
+    # -------------------------------------------------------------------------
+    # Publica o estado atual do carro em 'car_telemetry' (consumido pelo
+    # telemetry_node, que repassa pro dashboard via UDP)
+    # -------------------------------------------------------------------------
+    def publish_telemetry(self):
+        motor_on = (self.last_state in (1, 2)) and (self.last_power_pct > 0) and not self.killed
+
+        dist_to_target = None
+        if self.x_wp is not None and self.y_wp is not None:
+            dist_to_target = math.hypot(self.x_wp, self.y_wp)
+
+        payload = {
+            'timestamp': time.time(),
+            'motor_on': motor_on,
+            'killed': self.killed,
+            'state': self.last_state,
+            'power_pct': self.last_power_pct,
+            'steering_deg': self.last_steering_deg,
+            'x_wp': self.x_wp,
+            'y_wp': self.y_wp,
+            'dist_to_target': dist_to_target,
+            'serial_connected': self.serial_conn is not None,
+        }
+
+        msg = String()
+        msg.data = json.dumps(payload)
+        self.telemetry_publisher.publish(msg)
 
     # -------------------------------------------------------------------------
     # Ao encerrar o nó, garante que o carro pare antes de fechar a serial

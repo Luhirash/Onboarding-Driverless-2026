@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<title>Onboarding Driverless - Dashboard</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1115;
+    --card-bg: #171a21;
+    --border: #2a2e38;
+    --text: #e8eaed;
+    --text-dim: #8a8f98;
+    --green: #34d058;
+    --red: #ff4d4f;
+    --orange: #ffa940;
+    --accent: #4f8cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    padding: 24px;
+  }
+  h1 { font-size: 1.4rem; margin: 0 0 4px 0; }
+  .subtitle { color: var(--text-dim); margin-bottom: 24px; font-size: 0.9rem; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 20px;
+  }
+  .card-label {
+    color: var(--text-dim);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 8px;
+  }
+  .card-value { font-size: 1.6rem; font-weight: 600; }
+
+  .status-dot {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    margin-right: 8px;
+  }
+  .dot-green { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .dot-red { background: var(--red); box-shadow: 0 0 8px var(--red); }
+  .dot-gray { background: #555; }
+
+  .conn-banner {
+    display: none;
+    background: #4a1a1a;
+    border: 1px solid var(--red);
+    color: #ffb3b3;
+    padding: 10px 16px;
+    border-radius: 8px;
+    margin-bottom: 16px;
+    font-size: 0.9rem;
+  }
+  .conn-banner.show { display: block; }
+
+  .kill-section {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+  }
+  button {
+    border: none;
+    border-radius: 10px;
+    padding: 14px 28px;
+    font-size: 1rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform 0.05s ease;
+  }
+  button:active { transform: scale(0.97); }
+  #killBtn { background: var(--red); color: white; }
+  #resetBtn { background: var(--border); color: var(--text); }
+  #killAck { color: var(--text-dim); font-size: 0.85rem; }
+
+  .charts {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 800px) {
+    .charts { grid-template-columns: 1fr; }
+  }
+  canvas { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 8px; }
+</style>
+</head>
+<body>
+
+  <h1>🏎️ Onboarding Driverless — Dashboard</h1>
+  <div class="subtitle">Telemetria em tempo real via WebSocket (UDP Jetson &rarr; backend &rarr; navegador)</div>
+
+  <div class="conn-banner" id="connBanner">⚠️ Sem sinal da Jetson — verifique a conexão Wi-Fi / se os nós ROS2 estão rodando.</div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="card-label">Status do motor</div>
+      <div class="card-value"><span class="status-dot dot-gray" id="motorDot"></span><span id="motorText">--</span></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Kill switch</div>
+      <div class="card-value"><span class="status-dot dot-gray" id="killDot"></span><span id="killText">--</span></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Potência</div>
+      <div class="card-value" id="powerText">-- %</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Steering</div>
+      <div class="card-value" id="steeringText">-- °</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Distância ao alvo</div>
+      <div class="card-value" id="distText">-- m</div>
+    </div>
+  </div>
+
+  <div class="kill-section">
+    <button id="killBtn" onclick="sendKill('kill')">🛑 KILL SWITCH</button>
+    <button id="resetBtn" onclick="sendKill('reset')">↺ Resetar</button>
+    <span id="killAck"></span>
+  </div>
+
+  <div class="charts">
+    <canvas id="powerChart" height="220"></canvas>
+    <canvas id="mapChart" height="220"></canvas>
+  </div>
+
+<script>
+  const socket = io();
+
+  const MAX_POINTS = 60;
+  const powerData = { labels: [], power: [], steering: [] };
+
+  const powerChart = new Chart(document.getElementById('powerChart'), {
+    type: 'line',
+    data: {
+      labels: powerData.labels,
+      datasets: [
+        { label: 'Potência (%)', data: powerData.power, borderColor: '#4f8cff', tension: 0.3, pointRadius: 0 },
+        { label: 'Steering (graus)', data: powerData.steering, borderColor: '#ffa940', tension: 0.3, pointRadius: 0, yAxisID: 'y1' },
+      ]
+    },
+    options: {
+      responsive: true,
+      animation: false,
+      scales: {
+        y: { min: 0, max: 100, ticks: { color: '#8a8f98' } },
+        y1: { min: 0, max: 180, position: 'right', grid: { drawOnChartArea: false }, ticks: { color: '#8a8f98' } },
+        x: { ticks: { color: '#8a8f98', display: false } },
+      },
+      plugins: { legend: { labels: { color: '#e8eaed' } }, title: { display: true, text: 'Potência / Steering ao longo do tempo', color: '#e8eaed' } }
+    }
+  });
+
+  const mapChart = new Chart(document.getElementById('mapChart'), {
+    type: 'scatter',
+    data: {
+      datasets: [
+        { label: 'Carro', data: [{x: 0, y: 0}], backgroundColor: '#ff4d4f', pointRadius: 8, pointStyle: 'cross' },
+        { label: 'Waypoint', data: [], backgroundColor: '#34d058', pointRadius: 6 },
+      ]
+    },
+    options: {
+      responsive: true,
+      animation: false,
+      scales: {
+        x: { title: { display: true, text: 'X - frente (m)', color: '#8a8f98' }, ticks: { color: '#8a8f98' } },
+        y: { title: { display: true, text: 'Y - esquerda (m)', color: '#8a8f98' }, ticks: { color: '#8a8f98' } },
+      },
+      plugins: { legend: { labels: { color: '#e8eaed' } }, title: { display: true, text: 'Mapa local (visão de cima)', color: '#e8eaed' } }
+    }
+  });
+
+  socket.on('telemetry', (msg) => {
+    document.getElementById('connBanner').classList.remove('show');
+
+    const motorOn = !!msg.motor_on;
+    const killed = !!msg.killed;
+
+    const motorDot = document.getElementById('motorDot');
+    motorDot.className = 'status-dot ' + (motorOn ? 'dot-green' : 'dot-red');
+    document.getElementById('motorText').textContent = motorOn ? 'Ligado' : 'Desligado';
+
+    const killDot = document.getElementById('killDot');
+    killDot.className = 'status-dot ' + (killed ? 'dot-red' : 'dot-green');
+    document.getElementById('killText').textContent = killed ? 'ATIVO (travado)' : 'Livre';
+
+    document.getElementById('powerText').textContent = (msg.power_pct ?? '--') + ' %';
+    document.getElementById('steeringText').textContent = (msg.steering_deg ?? '--') + ' °';
+    document.getElementById('distText').textContent =
+      (msg.dist_to_target != null ? msg.dist_to_target.toFixed(2) : '--') + ' m';
+
+    // Gráfico de linha (potência / steering)
+    const t = new Date(msg.timestamp * 1000).toLocaleTimeString();
+    powerData.labels.push(t);
+    powerData.power.push(msg.power_pct ?? 0);
+    powerData.steering.push(msg.steering_deg ?? 90);
+    if (powerData.labels.length > MAX_POINTS) {
+      powerData.labels.shift(); powerData.power.shift(); powerData.steering.shift();
+    }
+    powerChart.update();
+
+    // Mapa local
+    if (msg.x_wp != null && msg.y_wp != null) {
+      mapChart.data.datasets[1].data = [{ x: msg.x_wp, y: msg.y_wp }];
+      mapChart.update();
+    }
+  });
+
+  socket.on('connection_status', (msg) => {
+    if (!msg.connected) {
+      document.getElementById('connBanner').classList.add('show');
+    }
+  });
+
+  socket.on('kill_switch_ack', (msg) => {
+    const el = document.getElementById('killAck');
+    el.textContent = `[${msg.action}] ${msg.response}`;
+    el.style.color = msg.ok ? '#34d058' : '#ff4d4f';
+  });
+
+  function sendKill(action) {
+    if (action === 'kill' && !confirm('Tem certeza que quer acionar o KILL SWITCH?')) return;
+    socket.emit('kill_switch', { action });
+  }
+</script>
+</body>
+</html>
