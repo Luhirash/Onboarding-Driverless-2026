@@ -170,7 +170,7 @@ class ControleNode(Node):
 
         # Satura no máximo esterçamento físico do carrinho
         delta_deg = max(-self.steering_max_delta_deg,
-                         min(self.steering_max_delta_deg, delta_deg))
+                        min(self.steering_max_delta_deg, delta_deg))
 
         steering_deg = self.steering_center_deg + delta_deg
         steering_deg = max(0.0, min(180.0, steering_deg))  # limite físico do servo
