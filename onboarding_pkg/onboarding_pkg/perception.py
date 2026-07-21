@@ -83,6 +83,11 @@ class PerceptionNode(Node):
         self.publisher_.publish(msg)
         self.get_logger().info(f"Coordenadas detectadas: {msg.data}")
 
+def destroy_node(self):
+    if self.zed.is_opened():
+        self.zed.close()
+        self.get_logger().info("CÂMERA ZED FECHADA")
+    super().destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)
